@@ -1,0 +1,295 @@
+---
+title: "Predictive Analytics for Future Fatal Overdose Demo"
+author: "John Halifax"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+## Installing and Loading Necessary R Packages
+
+```{r setup}
+# setting knitr options (default)
+knitr::opts_chunk$set(echo = TRUE)
+# packages needed for analysis
+list_of_packages<-c("tidyverse","glmnet","glmnetUtils","randomForest")
+# install packages if not already installed
+packages_to_install<-list_of_packages[!list_of_packages%in%installed.packages()]
+if(length(packages_to_install)>0){install.packages(packages_to_install)}
+# loading all needed packages
+lapply(list_of_packages,library,character.only=T)
+```
+
+## Read in and Prepare Data
+
+This data includes simulated counts of fatal overdoses, simulated counts of emergency medical service (EMS) responses to nonfatal overdoses, and select American Community Survey 5-year Estimate data (not simulated as it is publicly available). Data is included for six month periods (period 1 corresponds to January 1-June 30, period 2 to July 1-December 31) for years 2019-2021 across 809 census block groups (CBGs).  Data for 2020 and 2021 have been cross-walked to 2010 census boundaries.
+
+All variables with greater than 5% missingness have already been excluded, and remaining missing values have already been imputed (in a real scenario, we would only want to impute data after splitting it into train and test sets to avoid data leakage, but done previously here for example purposes). The only remaining preparation step is to prepare the next period fatal overdose count variable. 
+
+```{r}
+#read in data from csv file
+#file path here assumes csv file and current markdown are in the same folder
+# and the working directory is set to that folder (suggested)
+# otherwise specify different filepath for csv file
+dat<-read_csv(file = "simulated_data.csv")
+
+# creating next period all drug overdose death count variable
+dat<-dat %>% 
+  # sorting dataframe by cbg, year, and period
+  arrange(cbg_id,year,period) %>% 
+  # grouping by cbg so only generate next period OD count within each cbg
+  group_by(cbg_id) %>% 
+  # creating next period OD count 
+  # (n=1 as we only want the count 1 period into the future)
+  mutate(next_period_all_drug_overdose_count_simmed=lead(
+    x = all_drug_overdose_count_simmed,
+    n = 1)) %>% 
+  # ungrouping rows
+  ungroup() %>% 
+  #dropping rows from the most recent period we have data for
+  # as we do not have next period OD counts for them
+  filter(!(year==2021&period==2))
+```
+
+
+
+## Preparing Data as Train and Test Sets
+In this demo, we will hold out the rows from 2021 period 1 as the test set, and use the rows from 2019 period 2, 2020 period 1, and 2020 period 2 as the training data. We also remove ID variables which we do not want to include as predictors and save them as rownames of the dataframes for future use.
+```{r warning=FALSE}
+dat_train<-dat %>% filter((year==2019&period==2)|
+                            (year==2020&period==1)|
+                            (year==2020&period==2))
+dat_test<-dat %>% filter(year==2021&period==1)
+
+# define which variables are ID variables (not predictors)
+id_vars<-c("cbg_id","year","period")
+
+# set rownames to concatenated id variables and subsequently drop id variables
+# using quick function
+
+id_var_save_drop<-function(df,id_vars){
+  row_ids<-apply(X = df[id_vars],
+                              MARGIN = 1,
+                              FUN = paste,collapse="_")
+  df<-df[,!(colnames(df)%in%id_vars)]
+  row.names(df)<-row_ids
+  return(df)
+}
+
+dat_train<-id_var_save_drop(df = dat_train,id_vars = id_vars)
+dat_test<-id_var_save_drop(df = dat_test,id_vars = id_vars)
+```
+
+## Functions
+Importing our Prediction and Analysis Functions from other R scripts
+
+As with the data import step, it is best to have the 3 R scripts all reside in the same folder as this markdown file to make imports easy. If this is not the case, be sure to modify the filepath in the lines below to fit your filepath.
+```{r}
+source("CV_LASSO_to_RF_function.R")
+source("CV_LASSO_to_LM_function.R")
+source("Percent_OD_captured_functions.R")
+```
+
+
+## Predicting Next Period Fatal Overdoses using LASSO-screened Linear Regression
+
+Fitting the LASSO-screened linear regression only requires two pieces of information:
+-the data (the dat_train dataframe we just prepared)
+-the name of the outcome (in this case "next_period_all_drug_overdose_count_simmed")
+
+This takes less than a minute on my computer, but may take longer on others
+```{r}
+# set seed for random number generator 
+# ensures reproducible results 
+set.seed(2024)
+# use function we imported to fit linear model
+LM_model<-CV_LASSO_to_LM(data = dat_train,
+                         outcome = "next_period_all_drug_overdose_count_simmed")
+save(LM_model,file = "LM_model.Rdata")
+```
+
+The returned object is a list of three items
+1.) the full model fit on the full data after cross validated variable selection
+2.) A vector of the variables selected for inclusion in the linear model
+3.) Details from each of the 4 cross-validation folds 
+
+Let's check out the results
+```{r}
+summary(LM_model$full_model)
+LM_model$full_model_vars
+names(LM_model$fold_details)
+```
+Make Predictions on Test Set Using Trained Linear Model
+
+```{r}
+test_preds_LM<-predict(LM_model$full_model,newdata = dat_test,type = "response")
+y_actual<-dat_test$next_period_all_drug_overdose_count_simmed
+```
+
+
+## Predicting Next Period Fatal Overdoses using Random Forest
+
+Fitting the LASSO-screened random forest  requires more specification than the linear regression. We need to specify:
+
+-the data (the dat_train dataframe we just prepared)
+-the name of the outcome (in this case "next_period_all_drug_overdose_count_simmed")
+-NTREE, the number of trees we want to grow in each forest. The default values are 100 and 500, but you can increase these values and add more values as desired. 
+-NODESIZE, the stopping parameter for how deep the trees can grow. The number represents the number of observations in a terminal node (bigger value leads to shallower trees). The default values are 5, 10, and 15, but these can be changed. 
+-MTRY, the number of variables randomly selected to be eligible to be split on at each split. For regression trees, this is recommended to be (p/3) (the number of variables divided by 3). Since p for each random forest is dependent on the number of variables selected by the LASSO, by default MTRY is Null and candidate MTRY values are outer fold specific and calculated as (p/3), (p/3)+/-3, and (p/3)+/-6 for the value of p in each specific outer fold. This default set of candidate MTRY values can be changed to a standardized set of candidate positive integer values.
+
+This takes about 40 minutes on my computer, but may take longer on others. Training time will increase with increased values of NTREE and more combinations of candidate hyperparameters.
+
+Since this takes a while, I ran this earlier and saved the trained model. The chunk is therefore set to eval=false, which can be changed if you wish to run it. 
+```{r warning=FALSE, eval=FALSE}
+# set seed for random number generator 
+# ensures reproducible results 
+set.seed(2024)
+# use function we imported to fit random forest model
+#wrap model training line in system.time to record training time
+system.time(
+RF_model<-CV_LASSO_to_RF(data = dat_train,
+                         outcome = "next_period_all_drug_overdose_count_simmed",NTREE = c(100,500),NODESIZE = c(5,10,15),MTRY = NULL))
+#since this model takes a while to train, we save it 
+#so we can run this notebook faster in the future
+save(RF_model,file = "RF_model.Rdata")
+```
+
+The return object is a list of five items
+1.) The full model fit on the full data after cross validated variable selection
+2.) A dataframe with the calculated importances of the included variables
+3.) A vector of the variables selected for inclusion in the linear model
+4.) The values of the 3 tuned hyperparameters of the full model
+5.) Details from each of the 4 cross-validation folds 
+
+Let's check out the results
+```{r}
+load("RF_model.Rdata")
+RF_model$full_model_importance
+RF_model$full_model_vars
+RF_model$full_model_hyper_params
+RF_model$fold_details$fold_vars
+RF_model$fold_details$fold_metrics
+```
+
+Make Predictions on Test Set Using Trained Random Forest
+```{r}
+test_preds_RF<-predict(RF_model$full_model,newdata = dat_test,type="response")
+y_actual<-dat_test$next_period_all_drug_overdose_count_simmed
+```
+
+
+## Analyzing Our Predictions
+
+We will analyze our results using three metrics. Functions for these three metrics have already been imported in a prior chunk. 
+
+The first, mean squared error (MSE), is a traditional model evaluation metric when modelling continuous outcomes, and has the nice property of being composed of both model error and variance to balance the bias-variance tradeoff. 
+
+$$\text{MSE}=\frac{1}{n}\sum_{i=1}^{n}{(Y_i-\hat{Y_i})^2}$$
+
+The other two are both relatively novel metrics designed to evaluate these models in the context of implementing their predictions in the real public health world. Both require an "action percent" to be specified - this means what percent of geographical units do we wish to identify for prioritization for overdose mitigation efforts. In the following demo, we use 5, 10, 15, and 20 as the action percents we want to prioritize (prioritizing the top 5% might be useful when targeting a very limited or expensive intervention, top 20% might be useful when implementing a cheaper or more available intervention)
+
+The first of these implementation metrics is the percentage of total actual statewide overdose deaths captured in the geographical units (in this case CBGs) prioritized by the model. In other words, if we are interested in top 5% of geographical units by predicted overdose deaths, what percentage of the total actual statewide overdose deaths occur in those units in the top 5%? The number of geographic units under consideration, k, is a result of the action percent chosen. 
+
+$$\text{Percent of Total Overdoses Captured}=\frac{\sum_{k\in I}{Y_i}}{\sum_{i=1}^{n}{Y_i}} \times 100\\=\frac{\text{\# events in the units picked by the model}}{\text{\# events in all units}} \times 100$$
+
+
+# Calculate these metrics from our test predictions
+
+We will evaluate our linear model's performance first
+
+MSE:
+```{r}
+mse_LM<-Mean_squared_error(preds = test_preds_LM,yactual = y_actual);mse_LM
+```
+This value should be 0.2515218
+
+
+Percent of Total Overdoses Captured:
+
+Here we will set our action percentage (what top percent of geographical units we want to prioritize) as 5%.
+
+Our function to calculate this returns two items:
+1.) The percent of total overdoses captured
+2.) Which geographical units the model has prioritized
+```{r}
+Percent_captured_LM_5<-Percent_OD_captured(preds = test_preds_LM,
+                                           yactual = y_actual,
+                                           action_percent = 5)
+#the numerical value
+Percent_captured_LM_5$Percent_total_OD_captured
+```
+This value should be 12.83%
+
+
+```{r}
+#which units have been prioritized in the top 5% by predicted overdose deaths
+Percent_captured_LM_5$Prioritized_units
+```
+
+The above output also has the year and period IDs concatenated with it. Let's isolate just the geographical unit (CBG) IDs for ease of use
+```{r}
+CBGs_priortiized_LM_5<-substring(Percent_captured_LM_5$Prioritized_units,
+#change the indices to split the string on based on the length of your geo IDs
+                                 first = 1,
+                                 last = 3)
+CBGs_priortiized_LM_5
+```
+The CBGs prioritized should numbers 167, 486, 508, 743, 589, and thirty-five others
+
+
+
+Let's repeat this process, but with the random forest predictions
+
+```{r}
+mse_RF<-Mean_squared_error(preds = test_preds_RF,yactual = y_actual);mse_RF
+```
+This value should be 0.2488406
+
+
+```{r}
+Percent_captured_RF_5<-Percent_OD_captured(preds = test_preds_RF,
+                                           yactual = y_actual,
+                                           action_percent = 5)
+
+Percent_captured_RF_5$Percent_total_OD_captured
+```
+This value should be 13.36898%
+
+
+```{r}
+Percent_captured_RF_5$Prioritized_units
+CBGs_priortized_RF_5<-substring(Percent_captured_RF_5$Prioritized_units,
+#change the indices to split the string on based on the length of your geo IDs
+                                 first = 1,
+                                 last = 3)
+CBGs_priortized_RF_5
+```
+The CBGs prioritized should numbers 167, 486, 589, 435, 614, and thirty-five others
+
+
+
+What if we want to examine multiple prioritization scenarios with different action percents and with different model predictions?
+```{r}
+action_percents<-c(5,10,15,20)
+model_preds<-list(test_preds_LM,test_preds_RF)
+combos<-expand.grid(action_percents=action_percents,
+                 model_preds=model_preds)
+
+Percent_OD_captured_multi_results<-as.data.frame(
+  t(
+    mapply(FUN = Percent_OD_captured,
+            preds=combos$model_preds,
+            action_percent=combos$action_percents,
+            MoreArgs = list(yactual=y_actual))
+    )
+  )
+Percent_OD_captured_multi_results$model<-c(rep("LM",4),rep("RF",4))
+Percent_OD_captured_multi_results$action_percent<-rep(action_percents,2)
+Percent_OD_captured_multi_results$Prioritized_units<-sapply(
+  X = Percent_OD_captured_multi_results$Prioritized_units,
+  FUN = function(x){substring(x,1,3)})
+```
+
+
+
+
+
